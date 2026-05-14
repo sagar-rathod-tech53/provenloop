@@ -2,40 +2,111 @@ package services
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sagar-rathod-tech53/provenloop/config"
 	"github.com/sagar-rathod-tech53/provenloop/internal/models"
 	"github.com/sagar-rathod-tech53/provenloop/internal/repositories"
 	"github.com/sagar-rathod-tech53/provenloop/utils"
-	"golang.org/x/crypto/bcrypt"
 )
 
-var otpLength = 6 // Global variable for OTP length
-
 type AuthService struct {
-	DB                  *sql.DB
-	UserRepository      repositories.UserRepository
-	OTPRepository       repositories.OTPRepository
-	TokenExpiration     time.Duration
-	OTPLifespan         time.Duration
-	BlacklistRepository repositories.TokenBlacklistRepository
-	// Config              config.Config
+	UserRepo *repositories.UserRepository
 }
 
-// RegisterUserWithOTP handles the registration of a new user and sends an OTP.
-func (s *AuthService) RegisterUserWithOTP(ctx context.Context, email, username, password string) error {
-	// Hash the password
-	hashedPassword, err := utils.HashPassword(password)
+func (s *AuthService) RegisterUser(
+	ctx context.Context,
+	email string,
+	username string,
+	password string,
+) error {
+
+	ctx, cancel := context.WithTimeout(
+		ctx,
+		10*time.Second,
+	)
+	defer cancel()
+
+	// =====================================
+	// Check Existing User
+	// =====================================
+
+	exists, err := s.UserRepo.CheckUserExists(
+		ctx,
+		email,
+		username,
+	)
+
 	if err != nil {
-		return fmt.Errorf("failed to hash password: %w", err)
+		return err
 	}
 
-	// Create the user model
+	if exists {
+		return fmt.Errorf(
+			"email or username already exists",
+		)
+	}
+
+	// =====================================
+	// Concurrent Tasks
+	// =====================================
+
+	hashChan := make(chan string, 1)
+	hashErrChan := make(chan error, 1)
+
+	otpChan := make(chan string, 1)
+
+	// password hashing
+	go func() {
+
+		hashedPassword, err := utils.HashPassword(
+			password,
+		)
+
+		if err != nil {
+			hashErrChan <- err
+			return
+		}
+
+		hashChan <- hashedPassword
+	}()
+
+	// otp generation
+	go func() {
+
+		otp := utils.GenerateOTP(6)
+
+		otpChan <- otp
+	}()
+
+	// wait results
+	var hashedPassword string
+	var otp string
+
+	for i := 0; i < 2; i++ {
+
+		select {
+
+		case err := <-hashErrChan:
+			return err
+
+		case hash := <-hashChan:
+			hashedPassword = hash
+
+		case generatedOTP := <-otpChan:
+			otp = generatedOTP
+		}
+	}
+
+	// =====================================
+	// Create User
+	// =====================================
+
 	user := models.User{
+		ID:           uuid.New().String(),
 		Email:        email,
 		Username:     username,
 		PasswordHash: hashedPassword,
@@ -43,180 +114,967 @@ func (s *AuthService) RegisterUserWithOTP(ctx context.Context, email, username, 
 		UpdatedAt:    time.Now(),
 	}
 
-	// Save the user in the database
-	err = s.UserRepository.CreateUser(ctx, user)
+	err = s.UserRepo.CreateUser(
+		ctx,
+		user,
+	)
+
 	if err != nil {
-		return fmt.Errorf("failed to create user: %w", err)
+		return err
 	}
 
+	// =====================================
+	// Save OTP in Redis
+	// =====================================
+
+	err = config.RDB.Set(
+		ctx,
+		"otp:"+email,
+		otp,
+		5*time.Minute,
+	).Err()
+
+	if err != nil {
+		return err
+	}
+
+	// =====================================
+	// Send Email Async
+	// =====================================
+
+	go func() {
+
+		subject := "Email Verification OTP"
+
+		body := fmt.Sprintf(`
+<h1>Your OTP is: %s</h1>
+`, otp)
+
+		_ = utils.SendEmail(
+			email,
+			subject,
+			body,
+		)
+
+	}()
+
+	return nil
+}
+
+func (s *AuthService) VerifyOTP(
+	ctx context.Context,
+	email string,
+	otp string,
+) error {
+
+	// get otp from redis
+	storedOTP, err := config.RDB.Get(
+		ctx,
+		"otp:"+email,
+	).Result()
+
+	if err != nil {
+		return fmt.Errorf("otp expired or not found")
+	}
+
+	// compare otp
+	if storedOTP != otp {
+		return fmt.Errorf("invalid otp")
+	}
+
+	// delete otp after verification
+	err = config.RDB.Del(
+		ctx,
+		"otp:"+email,
+	).Err()
+
+	if err != nil {
+		return err
+	}
+
+	// mark verified in database
+	err = s.UserRepo.VerifyUser(
+		ctx,
+		email,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *AuthService) ResendRegistrationOTP(
+	ctx context.Context,
+	email string,
+) error {
+
+	ctx, cancel := context.WithTimeout(
+		ctx,
+		5*time.Second,
+	)
+	defer cancel()
+
+	// =========================================
+	// Check User Exists
+	// =========================================
+
+	exists, err := s.UserRepo.CheckUserExists(
+		ctx,
+		email,
+		"",
+	)
+
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		return fmt.Errorf(
+			"user not found",
+		)
+	}
+
+	// =========================================
 	// Generate OTP
-	otp := utils.GenerateOTP(otpLength)
+	// =========================================
 
-	// Create OTP record
-	otpRecord := models.OTP{
-		Email:      email,
-		OTP:        otp,
-		IsVerified: false,
-		CreatedAt:  time.Now(),
-	}
+	otp := utils.GenerateOTP(6)
 
-	// Save OTP to the database
-	err = s.OTPRepository.SaveOTP(ctx, otpRecord)
+	// =========================================
+	// Save OTP In Redis
+	// =========================================
+
+	err = config.RDB.Set(
+		ctx,
+		"otp:"+email,
+		otp,
+		10*time.Minute,
+	).Err()
+
 	if err != nil {
-		return fmt.Errorf("failed to save OTP: %w", err)
+		return err
 	}
 
-	// Send OTP email to the user
-	subject := "Verify Your Email Address with Do Host Network"
-	body := fmt.Sprintf(`Hello,
+	// =========================================
+	// Send Email In Background
+	// =========================================
 
-Thank you for choosing Do Host Network. Please use the One-Time Password (OTP) below to verify your email address.
+	go func() {
 
-Your OTP is: %s
+		subject := "Resend Registration OTP"
 
-This OTP is valid for the next 10 minutes. Please keep this code confidential and do not share it with anyone.
+		body := fmt.Sprintf(`
+<h2>Email Verification OTP</h2>
 
-If you did not request this email, please contact our support team or ignore this message.
+<h1>%s</h1>
 
-Best regards,
-The Do Host Network Team`, otp)
+<p>This OTP is valid for 10 minutes.</p>
+`, otp)
 
-	err = utils.SendEmail(email, subject, body)
-	if err != nil {
-		return fmt.Errorf("failed to send OTP email: %w", err)
-	}
+		err := utils.SendEmail(
+			email,
+			subject,
+			body,
+		)
 
-	fmt.Println("Registration and OTP email sent successfully to", email)
-	return nil
-}
-
-func (s *AuthService) LoginUser(ctx context.Context, identifier, password string) (string, string, error) {
-	// Step 1: Check if OTP is verified
-	otpRecord, err := s.OTPRepository.GetOTPByEmail(ctx, identifier)
-	if err != nil {
-		// Not fatal: if identifier is a username, it won't have OTP verification
-		otpRecord = nil
-	}
-	if otpRecord != nil && !otpRecord.IsVerified {
-		return "", "", errors.New("email not verified. Please verify your email before logging in")
-	}
-
-	// Step 2: Fetch user details from repository using email or username
-	user, err := s.UserRepository.GetUserByEmailOrUsername(identifier)
-	if err != nil {
-		return "", "", errors.New("invalid email/username or password")
-	}
-
-	// Step 3: Compare hashed password
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
-		return "", "", errors.New("invalid email/username or password")
-	}
-
-	// Step 4: Load config and generate JWT
-	cfg, err := config.LoadConfig(".")
-	if err != nil {
-		return "", "", fmt.Errorf("failed to load config: %w", err)
-	}
-
-	token, err := utils.GenerateToken(24*time.Hour, user.ID, cfg.TokenSecret)
-	if err != nil {
-		return "", "", err
-	}
-
-	// Return both token and user ID
-	return token, user.ID, nil
-}
-
-// LogoutUser handles user logout by invalidating the JWT token
-// func (s *AuthService) LogoutUser(ctx *gin.Context) {
-// 	// Invalidate the token (e.g., clear cookie or blacklist the token)
-// 	// Clear the token cookie
-// 	// Load config and generate JWT
-// 	cfg, err := config.LoadConfig(".")
-// 	if err != nil {
-// 		return  fmt.Errorf("failed to load config: %w", err)
-// 	}
-// 	ctx.SetCookie("token", "", -1, "/", cfg.COOKIEDOMAIN, false, true)
-
-// 	// Optionally, perform any other cleanup related to the token or session.
-
-// 	// No return needed if the action is successful
-// }
-
-// VerifyOTP handles OTP verification
-func (s *AuthService) VerifyOTP(ctx context.Context, email, otp string) error {
-	storedOTP, err := s.OTPRepository.GetOTPByEmail(ctx, email)
-	if err != nil {
-		return errors.New("OTP not found or expired")
-	}
-
-	if storedOTP.OTP != otp {
-		return errors.New("invalid OTP")
-	}
-
-	return s.OTPRepository.MarkUserVerified(ctx, email)
-}
-
-// ForgotPassword generates an OTP for password reset and sends an email
-func (s *AuthService) ForgotPassword(ctx context.Context, email string) error {
-	// Step 1: Check if user exists
-	user, err := s.UserRepository.GetUserByEmail(email)
-	if err != nil {
-		if err.Error() == "user not found" {
-			return fmt.Errorf("no user registered with this email")
+		if err != nil {
+			fmt.Println(
+				"failed to send resend otp email:",
+				err,
+			)
 		}
-		return fmt.Errorf("failed to check user: %w", err)
-	}
+	}()
 
-	// Step 2: Generate OTP
-	otp := utils.GenerateOTP(6) // Generate a 6-digit OTP
-
-	// Step 3: Create OTP record
-	otpRecord := models.OTP{
-		Email:      user.Email,
-		OTP:        otp,
-		IsVerified: false,
-		CreatedAt:  time.Now(),
-	}
-
-	// Step 4: Save OTP to the database
-	err = s.OTPRepository.SaveOTP(ctx, otpRecord)
-	if err != nil {
-		return fmt.Errorf("failed to save OTP: %w", err)
-	}
-
-	// Step 5: Send email
-	subject := "Reset Your Password - Do Host Network"
-	body := fmt.Sprintf(`Hello %s,
-
-We received a request to reset the password for your Do Host Network account. Please use the One-Time Password (OTP) below to reset your password.
-
-Your OTP is: %s
-
-This OTP is valid for the next 10 minutes. If you did not request this password reset, please contact our support team or ignore this email.
-
-Best regards,
-The Do Host Network Team`, user.Username, otp)
-
-	err = utils.SendEmail(user.Email, subject, body)
-	if err != nil {
-		return fmt.Errorf("failed to send OTP email: %w", err)
-	}
-
-	fmt.Println("Password reset email sent successfully to", user.Email)
 	return nil
 }
 
-// ResetPassword resets the user's password
-func (s *AuthService) ResetPassword(ctx context.Context, email, otp, newPassword string) error {
-	if err := s.VerifyOTP(ctx, email, otp); err != nil {
-		return err
-	}
+func (s *AuthService) LoginUser(
+	ctx context.Context,
+	emailOrUsername string,
+	password string,
+) models.LoginResponse {
 
-	hashedPassword, err := utils.HashPassword(newPassword)
+	ctx, cancel := context.WithTimeout(
+		ctx,
+		10*time.Second,
+	)
+	defer cancel()
+
+	// =====================================
+	// Get User
+	// =====================================
+
+	user, err := s.UserRepo.GetUserByEmailOrUsername(
+		ctx,
+		emailOrUsername,
+	)
+
 	if err != nil {
-		return err
+
+		return models.LoginResponse{
+			Status: false,
+			Error:  "invalid credentials",
+		}
 	}
 
-	return s.UserRepository.UpdatePassword(ctx, email, hashedPassword)
+	// =====================================
+	// Check Verification
+	// =====================================
+
+	if !user.IsVerified {
+
+		return models.LoginResponse{
+			Status: false,
+			Error:  "please verify your account",
+		}
+	}
+
+	// =====================================
+	// Channels
+	// =====================================
+
+	passwordChan := make(chan error, 1)
+
+	accessTokenChan := make(chan string, 1)
+	refreshTokenChan := make(chan string, 1)
+
+	tokenErrChan := make(chan error, 2)
+
+	// =====================================
+	// Concurrent Password Verification
+	// =====================================
+
+	go func() {
+
+		err := utils.VerifyPassword(
+			user.PasswordHash,
+			password,
+		)
+
+		passwordChan <- err
+	}()
+
+	// =====================================
+	// Concurrent Access Token Generation
+	// =====================================
+
+	go func() {
+
+		token, err := utils.GenerateAccessToken(
+			user.ID,
+		)
+
+		if err != nil {
+			tokenErrChan <- err
+			return
+		}
+
+		accessTokenChan <- token
+	}()
+
+	// =====================================
+	// Concurrent Refresh Token Generation
+	// =====================================
+
+	go func() {
+
+		token, err := utils.GenerateRefreshToken(
+			user.ID,
+		)
+
+		if err != nil {
+			tokenErrChan <- err
+			return
+		}
+
+		refreshTokenChan <- token
+	}()
+
+	var accessToken string
+	var refreshToken string
+
+	// =====================================
+	// Wait Concurrent Results
+	// =====================================
+
+	for i := 0; i < 3; i++ {
+
+		select {
+
+		case err := <-passwordChan:
+
+			if err != nil {
+
+				return models.LoginResponse{
+					Status: false,
+					Error:  "invalid credentials",
+				}
+			}
+
+		case token := <-accessTokenChan:
+
+			accessToken = token
+
+		case token := <-refreshTokenChan:
+
+			refreshToken = token
+
+		case err := <-tokenErrChan:
+
+			return models.LoginResponse{
+				Status: false,
+				Error:  err.Error(),
+			}
+		}
+	}
+
+	// =====================================
+	// Store Session In Redis Concurrently
+	// =====================================
+
+	go func() {
+
+		config.RDB.Set(
+			context.Background(),
+			"session:"+user.ID,
+			accessToken,
+			24*time.Hour,
+		)
+
+		config.RDB.Set(
+			context.Background(),
+			"refresh:"+user.ID,
+			refreshToken,
+			7*24*time.Hour,
+		)
+	}()
+
+	return models.LoginResponse{
+		Status:       true,
+		Token:        accessToken,
+		RefreshToken: refreshToken,
+	}
+}
+
+func (s *AuthService) RefreshToken(
+	ctx context.Context,
+	refreshToken string,
+) models.RefreshTokenResponse {
+
+	ctx, cancel := context.WithTimeout(
+		ctx,
+		10*time.Second,
+	)
+	defer cancel()
+
+	// =====================================
+	// Validate Refresh Token
+	// =====================================
+
+	userID, err := utils.ValidateRefreshToken(
+		refreshToken,
+	)
+
+	if err != nil {
+
+		return models.RefreshTokenResponse{
+			Status: false,
+			Error:  "invalid refresh token",
+		}
+	}
+
+	// =====================================
+	// Check Redis Session
+	// =====================================
+
+	storedRefreshToken, err := config.RDB.Get(
+		ctx,
+		"refresh:"+userID,
+	).Result()
+
+	if err != nil {
+
+		return models.RefreshTokenResponse{
+			Status: false,
+			Error:  "session expired",
+		}
+	}
+
+	if storedRefreshToken != refreshToken {
+
+		return models.RefreshTokenResponse{
+			Status: false,
+			Error:  "refresh token mismatch",
+		}
+	}
+
+	// =====================================
+	// Concurrent Token Generation
+	// =====================================
+
+	accessTokenChan := make(chan string, 1)
+	refreshTokenChan := make(chan string, 1)
+	errChan := make(chan error, 2)
+
+	// generate new access token
+	go func() {
+
+		token, err := utils.GenerateAccessToken(
+			userID,
+		)
+
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		accessTokenChan <- token
+	}()
+
+	// generate new refresh token
+	go func() {
+
+		token, err := utils.GenerateRefreshToken(
+			userID,
+		)
+
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		refreshTokenChan <- token
+	}()
+
+	var newAccessToken string
+	var newRefreshToken string
+
+	// =====================================
+	// Wait Results
+	// =====================================
+
+	for i := 0; i < 2; i++ {
+
+		select {
+
+		case token := <-accessTokenChan:
+			newAccessToken = token
+
+		case token := <-refreshTokenChan:
+			newRefreshToken = token
+
+		case err := <-errChan:
+
+			return models.RefreshTokenResponse{
+				Status: false,
+				Error:  err.Error(),
+			}
+		}
+	}
+
+	// =====================================
+	// Save New Tokens In Redis Concurrently
+	// =====================================
+
+	saveErrChan := make(chan error, 2)
+
+	// save access token
+	go func() {
+
+		err := config.RDB.Set(
+			ctx,
+			"session:"+userID,
+			newAccessToken,
+			24*time.Hour,
+		).Err()
+
+		saveErrChan <- err
+	}()
+
+	// save refresh token
+	go func() {
+
+		err := config.RDB.Set(
+			ctx,
+			"refresh:"+userID,
+			newRefreshToken,
+			7*24*time.Hour,
+		).Err()
+
+		saveErrChan <- err
+	}()
+
+	for i := 0; i < 2; i++ {
+
+		if err := <-saveErrChan; err != nil {
+
+			return models.RefreshTokenResponse{
+				Status: false,
+				Error: fmt.Sprintf(
+					"redis save failed: %v",
+					err,
+				),
+			}
+		}
+	}
+
+	return models.RefreshTokenResponse{
+		Status:       true,
+		Token:        newAccessToken,
+		RefreshToken: newRefreshToken,
+	}
+}
+
+func (s *AuthService) LogoutUser(
+	ctx context.Context,
+	accessToken string,
+	refreshToken string,
+) models.LogoutResponse {
+
+	ctx, cancel := context.WithTimeout(
+		ctx,
+		5*time.Second,
+	)
+	defer cancel()
+
+	userID, err := utils.ValidateRefreshToken(
+		refreshToken,
+	)
+
+	if err != nil {
+		return models.LogoutResponse{
+			Status: false,
+			Error:  "invalid refresh token",
+		}
+	}
+
+	storedToken, err := config.RDB.Get(
+		ctx,
+		"refresh:"+userID,
+	).Result()
+
+	if err != nil {
+
+		return models.LogoutResponse{
+			Status: false,
+			Error:  "user already logged out",
+		}
+	}
+
+	if storedToken != refreshToken {
+
+		return models.LogoutResponse{
+			Status: false,
+			Error:  "session mismatch",
+		}
+	}
+
+	errChan := make(chan error, 3)
+
+	// remove session
+	go func() {
+		errChan <- config.RDB.Del(
+			ctx,
+			"session:"+userID,
+		).Err()
+	}()
+
+	// remove refresh
+	go func() {
+		errChan <- config.RDB.Del(
+			ctx,
+			"refresh:"+userID,
+		).Err()
+	}()
+
+	// blacklist access token
+	go func() {
+		errChan <- config.RDB.Set(
+			ctx,
+			"blacklist:"+accessToken,
+			"true",
+			15*time.Minute,
+		).Err()
+	}()
+
+	for i := 0; i < 3; i++ {
+
+		if err := <-errChan; err != nil {
+
+			return models.LogoutResponse{
+				Status: false,
+				Error:  err.Error(),
+			}
+		}
+	}
+
+	return models.LogoutResponse{
+		Status: true,
+	}
+}
+
+func (s *AuthService) ForgotPassword(
+	ctx context.Context,
+	email string,
+) models.ForgotPasswordResponse {
+
+	ctx, cancel := context.WithTimeout(
+		ctx,
+		5*time.Second,
+	)
+	defer cancel()
+
+	// =====================================
+	// Check User Exists
+	// =====================================
+
+	exists, err := s.UserRepo.CheckUserExistsByEmail(
+		ctx,
+		email,
+	)
+
+	if err != nil {
+
+		return models.ForgotPasswordResponse{
+			Status: false,
+			Error:  err.Error(),
+		}
+	}
+
+	if !exists {
+
+		return models.ForgotPasswordResponse{
+			Status: false,
+			Error:  "user not found",
+		}
+	}
+
+	// =====================================
+	// Generate OTP
+	// =====================================
+
+	otp := utils.GenerateOTP(6)
+
+	// =====================================
+	// Save OTP In Redis
+	// =====================================
+
+	err = config.RDB.Set(
+		ctx,
+		"forgot_otp:"+email,
+		otp,
+		10*time.Minute,
+	).Err()
+
+	if err != nil {
+
+		return models.ForgotPasswordResponse{
+			Status: false,
+			Error:  err.Error(),
+		}
+	}
+
+	// =====================================
+	// Send Email In Background
+	// =====================================
+
+	go func() {
+
+		subject := "Forgot Password OTP"
+
+		body := fmt.Sprintf(`
+<h2>Password Reset OTP</h2>
+
+<h1>%s</h1>
+
+<p>This OTP is valid for 10 minutes.</p>
+`, otp)
+
+		_ = utils.SendEmail(
+			email,
+			subject,
+			body,
+		)
+
+	}()
+
+	// =====================================
+	// Immediate Response
+	// =====================================
+
+	return models.ForgotPasswordResponse{
+		Status: true,
+	}
+}
+
+func (s *AuthService) ResetPassword(
+	ctx context.Context,
+	email string,
+	otp string,
+	newPassword string,
+) models.ResetPasswordResponse {
+
+	ctx, cancel := context.WithTimeout(
+		ctx,
+		5*time.Second,
+	)
+	defer cancel()
+
+	// =====================================
+	// Get OTP From Redis
+	// =====================================
+
+	storedOTP, err := config.RDB.Get(
+		ctx,
+		"forgot_otp:"+email,
+	).Result()
+
+	if err != nil {
+
+		return models.ResetPasswordResponse{
+			Status: false,
+			Error:  "otp expired or not found",
+		}
+	}
+
+	// =====================================
+	// Compare OTP
+	// =====================================
+
+	if storedOTP != otp {
+
+		return models.ResetPasswordResponse{
+			Status: false,
+			Error:  "invalid otp",
+		}
+	}
+
+	// =====================================
+	// Concurrent Operations
+	// =====================================
+
+	var (
+		hashedPassword string
+		hashErr        error
+	)
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	// hash password concurrently
+	go func() {
+		defer wg.Done()
+
+		hashedPassword, hashErr = utils.HashPassword(
+			newPassword,
+		)
+	}()
+
+	wg.Wait()
+
+	if hashErr != nil {
+
+		return models.ResetPasswordResponse{
+			Status: false,
+			Error:  hashErr.Error(),
+		}
+	}
+
+	// =====================================
+	// Update Password
+	// =====================================
+
+	err = s.UserRepo.UpdatePassword(
+		ctx,
+		email,
+		hashedPassword,
+	)
+
+	if err != nil {
+
+		return models.ResetPasswordResponse{
+			Status: false,
+			Error:  err.Error(),
+		}
+	}
+
+	// =====================================
+	// Delete OTP From Redis
+	// =====================================
+
+	go func() {
+
+		config.RDB.Del(
+			context.Background(),
+			"forgot_otp:"+email,
+		)
+
+	}()
+
+	// =====================================
+	// Send Email In Background
+	// =====================================
+
+	go func() {
+
+		subject := "Password Reset Successful"
+
+		body := `
+<h2>Password Reset Successful</h2>
+
+<p>Your password has been changed successfully.</p>
+`
+
+		_ = utils.SendEmail(
+			email,
+			subject,
+			body,
+		)
+
+	}()
+
+	return models.ResetPasswordResponse{
+		Status: true,
+	}
+}
+
+func (s *AuthService) ChangePassword(
+	ctx context.Context,
+	userID string,
+	oldPassword string,
+	newPassword string,
+) models.ChangePasswordResponse {
+
+	ctx, cancel := context.WithTimeout(
+		ctx,
+		5*time.Second,
+	)
+	defer cancel()
+
+	// =====================================
+	// Get User
+	// =====================================
+
+	user, err := s.UserRepo.GetUserByID(
+		ctx,
+		userID,
+	)
+
+	if err != nil {
+
+		return models.ChangePasswordResponse{
+			Status: false,
+			Error:  "user not found",
+		}
+	}
+
+	// =====================================
+	// Verify old password
+	// =====================================
+
+	err = utils.VerifyPassword(
+		user.PasswordHash,
+		oldPassword,
+	)
+
+	if err != nil {
+
+		return models.ChangePasswordResponse{
+			Status: false,
+			Error:  "old password incorrect",
+		}
+	}
+
+	// =====================================
+	// prevent same password
+	// =====================================
+
+	if oldPassword == newPassword {
+
+		return models.ChangePasswordResponse{
+			Status: false,
+			Error:  "new password cannot be same as old password",
+		}
+	}
+
+	// =====================================
+	// hash concurrently
+	// =====================================
+
+	var (
+		hashedPassword string
+		hashErr        error
+	)
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	go func() {
+
+		defer wg.Done()
+
+		hashedPassword,
+			hashErr = utils.HashPassword(
+			newPassword,
+		)
+
+	}()
+
+	wg.Wait()
+
+	if hashErr != nil {
+
+		return models.ChangePasswordResponse{
+			Status: false,
+			Error:  hashErr.Error(),
+		}
+	}
+
+	// =====================================
+	// update db
+	// =====================================
+
+	err = s.UserRepo.ChangePassword(
+		ctx,
+		userID,
+		hashedPassword,
+	)
+
+	if err != nil {
+
+		return models.ChangePasswordResponse{
+			Status: false,
+			Error:  err.Error(),
+		}
+	}
+
+	// =====================================
+	// background email
+	// =====================================
+
+	go func() {
+
+		subject := "Password Changed"
+
+		body := `
+		<h2>Password Updated</h2>
+
+		<p>Your password changed successfully.</p>
+		`
+
+		_ = utils.SendEmail(
+			user.Email,
+			subject,
+			body,
+		)
+
+	}()
+
+	return models.ChangePasswordResponse{
+		Status: true,
+	}
 }
